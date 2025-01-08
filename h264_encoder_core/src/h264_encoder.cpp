@@ -25,6 +25,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
@@ -182,15 +183,17 @@ public:
     fps_den_ = fps_den;
     bitrate_ = bitrate;
 
+#if LIBAVFORMAT_VERSION_MAJOR < 59
     avcodec_register_all();
+#endif
 
     /* find the mpeg1 video encoder */
     AVCodec * codec = nullptr;
     AVDictionary * opts = nullptr;
     if (codec_name.empty()) {
-      codec = avcodec_find_encoder_by_name(kDefaultHardwareCodec);
+      codec = (AVCodec*)avcodec_find_encoder_by_name(kDefaultHardwareCodec);
       if (AWS_ERR_OK != open_codec(codec, opts)) {
-        codec = avcodec_find_encoder_by_name(kDefaultSoftwareCodec);
+        codec = (AVCodec*)avcodec_find_encoder_by_name(kDefaultSoftwareCodec);
 	      av_dict_set(&opts, "preset", "veryfast", 0);
         av_dict_set(&opts, "tune", "zerolatency", 0);
 
@@ -201,7 +204,7 @@ public:
         }
       }
     } else {
-      codec = avcodec_find_encoder_by_name(codec_name.c_str());
+      codec = (AVCodec*)avcodec_find_encoder_by_name(codec_name.c_str());
       if (AWS_ERR_OK != open_codec(codec, opts)) {
         AWS_LOGSTREAM_ERROR(__func__, codec_name << " codec not found!");
         return AWS_ERR_NOT_FOUND;
@@ -265,21 +268,21 @@ public:
       return AWS_ERR_NULL_PARAM;
     }
 
-    AVPacket pkt;
-
     /* Convert from image encoding to YUV420P */
     const uint8_t * buf_in[4] = {img_data, nullptr, nullptr, nullptr};
     sws_scale(convert_ctx_, (const uint8_t * const *)buf_in, &src_stride_, 0, src_height_,
               pic_in_->data, pic_in_->linesize);
 
     /* Encode */
-    av_init_packet(&pkt);
-    pkt.data = nullptr;  // packet data will be allocated by the encoder
-    pkt.size = 0;
+#if LIBAVCODEC_VERSION_MAJOR < 59
+    AVPacket* pkt;
+    av_init_packet(pkt);
+    pkt->data = nullptr;  // packet data will be allocated by the encoder
+    pkt->size = 0;
 
     int got_output = 0;
 
-    int ret = avcodec_encode_video2(param_, &pkt, pic_in_, &got_output);
+    int ret = avcodec_encode_video2(param_, pkt, pic_in_, &got_output);
     ++pic_in_->pts;
     if (ret < 0) {
       AWS_LOGSTREAM_ERROR(__func__,
@@ -288,15 +291,43 @@ public:
     }
     if (got_output) {
       res.Reset();
-      res.frame_data.insert(res.frame_data.end(), pkt.data, pkt.data + pkt.size);
-      res.frame_pts = frame_duration_ * (0 <= pkt.pts ? pkt.pts : 0);
-      res.frame_dts = frame_duration_ * (0 <= pkt.dts ? pkt.dts : 0);
+      res.frame_data.insert(res.frame_data.end(), pkt->data, pkt->data + pkt->size);
+      res.frame_pts = frame_duration_ * (0 <= pkt->pts ? pkt->pts : 0);
+      res.frame_dts = frame_duration_ * (0 <= pkt->dts ? pkt->dts : 0);
       res.frame_duration = frame_duration_;
-      res.key_frame = pkt.flags & AV_PKT_FLAG_KEY;
-      av_free_packet(&pkt);
+      res.key_frame = pkt->flags & AV_PKT_FLAG_KEY;
+      av_free_packet(pkt);
 
       return AWS_ERR_OK;
     }
+#else
+    AVPacket* pkt = av_packet_alloc();
+
+    int send_frame_ret = avcodec_send_frame(param_, pic_in_);
+    ++pic_in_->pts;
+    if (send_frame_ret  < 0)
+    {
+      AWS_LOGSTREAM_ERROR(__func__,
+                          "Error encoding frame (avcodec_send_frame() returned: " << send_frame_ret << ")");
+      av_packet_free(&pkt);
+      return AWS_ERR_FAILURE;
+    }
+
+    int got_output = avcodec_receive_packet(param_, pkt);
+    if (got_output)
+    {
+      res.Reset();
+      res.frame_data.insert(res.frame_data.end(), pkt->data, pkt->data + pkt->size);
+      res.frame_pts = frame_duration_ * (0 <= pkt->pts ? pkt->pts : 0);
+      res.frame_dts = frame_duration_ * (0 <= pkt->dts ? pkt->dts : 0);
+      res.frame_duration = frame_duration_;
+      res.key_frame = pkt->flags & AV_PKT_FLAG_KEY;
+      av_packet_free(&pkt);
+      return AWS_ERR_OK;
+    }
+
+    av_packet_free(&pkt);
+#endif
 
     return AWS_ERR_EMPTY;
   }
